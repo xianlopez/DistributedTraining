@@ -4,24 +4,42 @@ import datetime
 import tools
 from threading import Thread
 import os
+import tensorflow as tf
 
 loopPeriod_s = 30
 experimentsFolder = ''  # TODO
 workerInfoFileName = 'workerid.txt'
+maxExecTime_h = 72
+
+# TODO: Share with director
+EC_NOERROR = -1
+EC_OOM = 1
+EC_OTHER = 2
 
 
 class ExecutionInfo:
-    def __init__(self, expId, assignmentId, success, errorCode, execTime):
+    def __init__(self, expId, success, errorCode, execTime):
         self.expId = expId
-        self.assignmentId = assignmentId
         self.success = success
         self.errorCode = errorCode
         self.execTime = execTime
 
 
+class ResultsSummary:
+    def __init__(self, bestEpoch, loss, accuracy, iou, mAP):
+        self.bestEpoch = bestEpoch
+        self.loss = loss
+        self.accuracy = accuracy
+        self.iou = iou
+        self.mAP = mAP
+
+
 class Worker:
     def __init__(self):
+        self.resultsSummary = None
+        self.execInfo = None
         self.working = False
+        self.currAsgId = None
         self.pendingFinishedTask = False
         self.conn, self.cursor = connection.connect()
         self.workerThread = None
@@ -41,12 +59,18 @@ class Worker:
             lines = [line for line in lines if line != '']
             assert len(lines) == 1, 'There should be exactly one non-empty line in ' + workerInfoFileName + \
                                     ', but there are ' + str(len(lines))
+            # Parse id number:
             try:
                 self.workerId = int(lines[0])
             except Exception as ex:
                 print('Error parsing worker id.')
                 print(ex)
                 raise
+            # Check there is a registered worker in database with this id:
+            self.cursor.execute('select WorkerId from REGISTERED_WORKERS where WorkerId=' + str(self.workerId))
+            query = self.cursor.fetchall()
+            assert len(query) == 1, 'There should be exactly one worker registered in database with id ' + \
+                                    str(self.workerId) + ', but there are ' + str(len(query))
 
     def DoWork(self):
         while True:
@@ -56,12 +80,16 @@ class Worker:
                 # Send heartbit:
                 self.SendHeartbit()
 
+                # Check timed-out tasks in progress:
+                # if self.working:
+                #     self.CheckTimedoutTasks()
+
                 # See if a task has been finished.
-                if self.ReadPendingFinishedTaskFlag():
+                if self.GetPendingFinishedTask():
                     self.ProcessFinishedTask()
 
                 # Search for new tasks, and execute them.
-                if not self.ReadWorkingFlag():
+                if not self.working:
                     self.SearchAndDoTasks()
 
             except Exception as ex:
@@ -74,36 +102,67 @@ class Worker:
             if lapse_s < loopPeriod_s:
                 time.sleep(loopPeriod_s - lapse_s)
 
-    def DoTask(self, exp, columns, assignmentId):
+    def DoTask(self, exp, columns):
         print('Start of working thread!')
         start = time.time()
         expId = exp[columns['ExpId']]
-        CreateExperimentFolder(assignmentId)
-        time.sleep(120)
+        expDir = CreateExperimentFolder(self.GetCurrAsgId())
+        try:
+            time.sleep(120)  # TODO
+            success = True
+            errorCode = EC_NOERROR
+        except tf.errors.ResourceExhaustedError:
+            print('Error executing experiment: Out Of Memory.')
+            success = False
+            errorCode = EC_OOM
+        except Exception as ex:
+            print('Unexpected error executing experiment.')
+            print(ex)
+            success = False
+            errorCode = EC_OTHER
         end = time.time()
-        execTime = datetime.timedelta(seconds=start - end)
-        success = True  # TODO
-        errorCode = -1  # TODO
-        execInfo = ExecutionInfo(expId, assignmentId, success, errorCode, execTime)
+        execTime = datetime.timedelta(seconds=start-end)
+        execInfo = ExecutionInfo(expId, success, errorCode, execTime)
+        if success:
+            bestEpoch, loss, accuracy, iou, mAP = ReadExecutionResults(expDir)
+            resultsSummary = ResultsSummary(bestEpoch, loss, accuracy, iou, mAP)
+        else:
+            resultsSummary = None
+        self.SetResultsSummary(resultsSummary)
         self.SetExecInfo(execInfo)
-        self.SetPendingFinishedTaskFlag(True)
+        self.SetPendingFinishedTask(True)
         print('End of working thread.')
         return
 
     def ProcessFinishedTask(self):
-        bestEpoch, loss, accuracy, iou, mAP = ReadExecutionResults()
-        self.cursor.execute('insert into RESULTS (BestEpoch, Loss, Accuracy, IoU, mAP) values (?, ?, ?, ?, ?)',
-                            (bestEpoch, loss, accuracy, iou, mAP))
-        resultsId = self.cursor.execute("select SCOPE_IDENTITY()").fetchone()[0]
         execInfo = self.GetExecInfo()
+        if execInfo.success:
+            resultsSummary = self.GetResultsSummary()
+            self.cursor.execute('insert into RESULTS (BestEpoch, Loss, Accuracy, IoU, mAP) values (?, ?, ?, ?, ?)',
+                                (resultsSummary.bestEpoch, resultsSummary.loss, resultsSummary.accuracy,
+                                 resultsSummary.iou, resultsSummary.mAP))
+            resultsId = self.cursor.execute("select SCOPE_IDENTITY()").fetchone()[0]
+        else:
+            resultsId = None
         self.cursor.execute('insert into EXECUTIONS (ExpId, WorkerId, AssignmnetId, ResultsId, Success, ErrorCode, '
                             'ExecTime, Processed) values (?, ?, ?, ?, ?, ?, ?, ?)',
                             (execInfo.expId, self.workerId, execInfo.assignmentId, resultsId, execInfo.success,
                              execInfo.errorCode, execInfo.execTime, False))
         self.conn.commit()
-        self.SetPendingFinishedTaskFlag(False)
-        self.SetWorkingFlag(False)
+        self.SetPendingFinishedTask(False)
+        self.working = False
         return
+
+    def CheckTimedoutTasks(self):
+        print('Checking if running task is timed-out...')
+        # self.cursor.execute('select * from ASSIGNMENTS where AssignmentId=' + str(self.GetCurrAsgId()))
+        # query = self.cursor.fetchall()
+        # columns = tools.get_columns_map(self.cursor)
+        # dateTaken = query[0][columns['TakenDate']]
+        # timeDelta = datetime.datetime.now() - dateTaken
+        # if timeDelta > datetime.timedelta(hours=maxExecTime_h):
+        #     print('Task timed-out!')
+        #     TODO
 
     def SearchAndDoTasks(self):
         print('Searching for new tasks...')
@@ -133,10 +192,12 @@ class Worker:
                                     'but there are ' + str(len(query_exp))
         exp = query_exp[0]
         columns_exp = tools.get_columns_map(self.cursor)
-        self.workerThread = Thread(target=self.DoTask, args=(exp, columns_exp, assignmentId))
-        self.cursor.execute('update ASSIGNMENTS set InProgress=1 where AssignmentId=' + str(assignmentId))
+        self.cursor.execute('update ASSIGNMENTS set InProgress=1 and TakenDate=? where AssignmentId='
+                            + str(assignmentId), datetime.datetime.now())
         self.conn.commit()
-        self.SetWorkingFlag(True)
+        self.working = True
+        self.currAsgId = assignmentId
+        self.workerThread = Thread(target=self.DoTask, args=(exp, columns_exp))
         print('Worker thread launched. Continue with normal loop.')
         return
 
@@ -152,23 +213,29 @@ class Worker:
                                 (datetime.datetime.now()))
         self.conn.commit()
 
-    def ReadPendingFinishedTaskFlag(self):
-        return self.pendingFinishedTask
-
-    def SetPendingFinishedTaskFlag(self, value):
+    def SetPendingFinishedTask(self, value):
         self.pendingFinishedTask = value
 
-    def ReadWorkingFlag(self):
-        return self.working
-
-    def SetWorkingFlag(self, value):
-        self.working = value
+    def GetPendingFinishedTask(self):
+        return self.pendingFinishedTask
 
     def SetExecInfo(self, value):
         self.execInfo = value
 
     def GetExecInfo(self):
         return self.execInfo
+
+    def SetResultsSummary(self, value):
+        self.resultsSummary = value
+
+    def GetResultsSummary(self):
+        return self.resultsSummary
+
+    def GetCurrAsgId(self):
+        if not self.working:
+            raise Exception('It is not allowed to get currAsgId if working=False.')
+        else:
+            return self.currAsgId
 
 
 def CreateExperimentFolder(assignmentId):
@@ -189,6 +256,6 @@ def CreateExperimentFolder(assignmentId):
     return expDir
 
 
-def ReadExecutionResults():
+def ReadExecutionResults(expDir):
     # TODO
     return 1, 1, 1, 1, 1
