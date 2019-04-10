@@ -2,20 +2,26 @@ import time
 import connection
 import tools
 import datetime
+import numpy as np
 
 loopPeriod_s = 30
 maxTaskTime_h = 72
 maxAssignmentWaitingTime_h = 24
 EC_OOM = 1
+HeartbitPeriod_s = 300
 
 
 class Director:
     def __init__(self):
         self.conn, self.cursor = connection.connect()
+        self.maxLapseWithoutHeartbit = datetime.timedelta(seconds=2*HeartbitPeriod_s)
 
     def DoWork(self):
         while True:
             start = time.time()
+
+            # Set as offline the workers that have no heartbit.
+            self.UpdateOnlineWorkers()
 
             # Check finished tasks.
             self.CheckFinishedTasks()
@@ -32,17 +38,48 @@ class Director:
             if lapse_s < loopPeriod_s:
                 time.sleep(loopPeriod_s - lapse_s)
 
+    def UpdateOnlineWorkers(self):
+        print('Reading workers heartbits to update ONLINE_WORKERS table...')
+        self.cursor.execute('select * from ONLINE_WORKERS')
+        query = self.cursor.fetchall()
+        columns = tools.get_columns_map(self.cursor)
+        now = datetime.datetime.now()
+        for row in query:
+            workerId = row[columns['WorkerId']]
+            lastHearbit = row[columns['LastHeartbit']]
+            lapse = now - lastHearbit
+            if lapse > self.maxLapseWithoutHeartbit:
+                print('Worker ' + str(workerId) + ' is offline.')
+                self.cursor.execute('delete from ONLINE_WORKERS where WorkerId=' + str(workerId))
+                self.conn.commit()
+                print('Deleted from online table.')
+
+
     def AssignNewTasksToWorkers(self):
+        print('Assigning new tasks to workers...')
         self.cursor.execute('select * from EXPERIMENTS where Finished=0 and Assigned=0')
         query_exp = self.cursor.fetchall()
         columns_exp = tools.get_columns_map(self.cursor)
-        for exp in query_exp:
-            memory = exp[columns_exp['InsufficientMemory_GB']]
-            if memory is None:
-                memory = 0
-            valid_workers, queues = self.GetValidOnlineWorkersWithQueue(memory)
+        if len(query_exp) == 0:
+            print('There are no new tasks.')
+        else:
+            for exp in query_exp:
+                expId = exp[columns_exp['IdExp']]
+                print('Experiment ' + str(expId))
+                memory = exp[columns_exp['InsufficientMemory_GB']]
+                if memory is None:
+                    memory = 0
+                valid_workers, queues = self.GetValidOnlineWorkersWithQueue(memory)
+                selected_worker = self.SelectoWorkerToAssignTask(valid_workers, queues)
+                self.cursor.execute('insert into ASSIGNMENTS (ExpId, WorkerId, '
+                                    'InProgress, Finished, Discarded, AssignmentDate) values (?, ?, ?, ?, ?, ?)',
+                                    (expId, selected_worker, False, False, False, datetime.datetime.now()))
+                self.cursor.execute('update EXPERIMENTS set Assigned=1 where IdExp=' + str(expId))
+                self.conn.commit()
+                print('Assigned to ' + str(selected_worker))
 
     def CheckFinishedTasks(self):
+        print('Checking finished tasks...')
         self.cursor.execute('select * from EXECUTIONS where Processed=0')
         query = self.cursor.fetchall()
         columns = tools.get_columns_map(self.cursor)
@@ -51,7 +88,6 @@ class Director:
                 # Successful execution.
                 self.cursor.execute('update EXPERIMENTS set Finished=1, FinalExecId=' + str(row[columns['exec.ExecId']])
                                     + ' where ExpId=' + str(row[columns['exec.ExpId']]))
-                self.conn.commit()
             else:
                 if row[columns['exec.ErrorCode']] == EC_OOM:
                     # Out Of Memory.
@@ -59,7 +95,6 @@ class Director:
                     currentMemory = self.GetMemoryOfWorker(row[columns['exec.WorkerId']])
                     self.cursor.execute('update EXPERIMENTS set InsufficientMemory_GB=' + str(currentMemory) +
                                         ' where ExpId=' + str(row[columns['ExpId']]))
-                    self.conn.commit()
                     # Check if there are workers with more memory:
                     self.cursor.execute('select WorkerId from REGISTERED_WORKERS where GPUMemory>' + str(currentMemory))
                     query_workers = self.cursor.fetchall()
@@ -68,17 +103,14 @@ class Director:
                         # Mark the experiment as not assigned.
                         self.cursor.execute('update EXPERIMENTS set Assigned=0 where ExpId=' +
                                             str(row[columns['ExpId']]))
-                        self.conn.commit()
                     else:
                         # There aren't. Mark as failure.
                         self.cursor.execute('update EXPERIMENTS set Finished=1, FinalExecId=' + str(row[columns['exec.ExecId']])
                                             + ' where ExpId=' + str(row[columns['exec.ExpId']]))
-                        self.conn.commit()
                 else:
                     # Other error. Mark as failure.
                     self.cursor.execute('update EXPERIMENTS set Finished=1, FinalExecId=' + str(row[columns['exec.ExecId']])
                                         + ' where ExpId=' + str(row[columns['exec.ExpId']]))
-                    self.conn.commit()
 
             # Finally, mark the execution as processed, in order not to process it again:
             self.cursor.execute('update EXECUTIONS set Processed=1 where ExecId=' + str(row[columns['exec.ExecId']]))
@@ -109,12 +141,24 @@ class Director:
                 queues[workerId] = 1
         return valid_workers, queues
 
-    def MarkExperimentAsFailure(self, expId, execId):
-        self.cursor.execute('update EXPERIMENTS set Finished=1, FinalExecId=' + str(execId)
-                            + ' where ExpId=' + str(expId))
-        self.conn.commit()
+    def SelectoWorkerToAssignTask(self, workers, queues):
+        if len(workers) == 0:
+            raise Exception('No workers to select.')
+        min_queue = np.inf
+        for wk in workers:
+            min_queue = np.minimum(min_queue, queues[wk])
+        selected_worker = None
+        for wk in workers:
+            if queues[wk] == min_queue:
+                selected_worker = wk
+                break
+        if selected_worker is None:
+            raise Exception('Error selecting worker.')
+        else:
+            return selected_worker
 
     def CheckAssignmentsWithOfflineWorkers(self):
+        print('Checking assignments with offline workers...')
         self.cursor.execute('select asg.* from ASSIGNMENTS where InProgress=1 and Finished=0 and Discarded=0')
         query_asg = self.cursor.fetchall()
         columns_asg = tools.get_columns_map(self.cursor)
@@ -130,10 +174,13 @@ class Director:
                     break
             if not foundOnlineWorker:
                 # De-assign.
+                asg_id = asg[columns_asg['AssignmentId']]
+                print('Worker of assignment ' + str(asg_id) + ' is offline.')
                 self.cursor.execute('update ASSIGNMENTS set InProgress=0, Discarded=1 where AssignmentId=' +
-                                    str(asg[columns_asg['AssignmentId']]))
+                                    str(asg_id))
                 self.cursor.execute('update EXPERIMENTS set Assigned=0 where ExpId=' + str(asg[columns_asg['ExpId']]))
                 self.conn.commit()
+                print('De-assigned.')
 
 
 

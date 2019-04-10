@@ -1,3 +1,4 @@
 credentials.py
+workerid.txt
 *.pyc
 .idea*
