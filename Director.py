@@ -3,24 +3,31 @@ import connection
 import tools
 import datetime
 import numpy as np
+import glob
 
-loopPeriod_s = 30
 maxTaskTime_h = 72
 maxAssignmentWaitingTime_h = 24
-EC_OOM = 1
-HeartbitPeriod_s = 300
 
 
 class Director:
     def __init__(self):
         self.conn, self.cursor = connection.connect()
-        self.maxLapseWithoutHeartbit = datetime.timedelta(seconds=2*HeartbitPeriod_s)
+        self.maxLapseWithoutHeartbeat = datetime.timedelta(seconds=2*self.heartbeatPeriod_s)
+        self.ReadSettings()
+
+    # Read settings from database.
+    def ReadSettings(self):
+        self.cursor.execute('select Value from SETTINGS where Name=\'HeartbeatPeriod_s\'')
+        self.heartbeatPeriod_s = self.cursor.fetchone()[0][0]
 
     def DoWork(self):
         while True:
             start = time.time()
 
-            # Set as offline the workers that have no heartbit.
+            # Send heartbeat:
+            self.SendHeartbeat()
+
+            # Set as offline the workers that have no heartbeat.
             self.UpdateOnlineWorkers()
 
             # Check finished tasks.
@@ -35,20 +42,25 @@ class Director:
             # Wait for new loop.
             end = time.time()
             lapse_s = end - start
-            if lapse_s < loopPeriod_s:
-                time.sleep(loopPeriod_s - lapse_s)
+            if lapse_s < self.heartbeatPeriod_s:
+                time.sleep(self.heartbeatPeriod_s - lapse_s)
+
+    def SendHeartbeat(self):
+        print('Updating heartbeat...')
+        self.cursor.execute('update MASTER set LastHeartbeat=?', (datetime.datetime.now()))
+        self.conn.commit()
 
     def UpdateOnlineWorkers(self):
-        print('Reading workers heartbits to update ONLINE_WORKERS table...')
+        print('Reading workers heartbeats to update ONLINE_WORKERS table...')
         self.cursor.execute('select * from ONLINE_WORKERS')
         query = self.cursor.fetchall()
         columns = tools.get_columns_map(self.cursor)
         now = datetime.datetime.now()
         for row in query:
             workerId = row[columns['WorkerId']]
-            lastHearbit = row[columns['LastHeartbit']]
+            lastHearbit = row[columns['LastHeartbeat']]
             lapse = now - lastHearbit
-            if lapse > self.maxLapseWithoutHeartbit:
+            if lapse > self.maxLapseWithoutHeartbeat:
                 print('Worker ' + str(workerId) + ' is offline.')
                 self.cursor.execute('delete from ONLINE_WORKERS where WorkerId=' + str(workerId))
                 self.conn.commit()
@@ -89,7 +101,7 @@ class Director:
                 self.cursor.execute('update EXPERIMENTS set Finished=1, FinalExecId=' + str(row[columns['exec.ExecId']])
                                     + ' where ExpId=' + str(row[columns['exec.ExpId']]))
             else:
-                if row[columns['exec.ErrorCode']] == EC_OOM:
+                if row[columns['exec.ErrorCode']] == glob.EC_OOM:
                     # Out Of Memory.
                     # Mark this amount of memory as insufficient in the experiment:
                     currentMemory = self.GetMemoryOfWorker(row[columns['exec.WorkerId']])
