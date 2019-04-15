@@ -3,7 +3,7 @@ import connection
 conn, cursor = connection.connect()
 
 cursor.execute("CREATE TABLE EXECUTIONS ("
-               "ExecId int NOT NULL PRIMARY KEY, "
+               "ExecId int NOT NULL PRIMARY KEY AUTO_INCREMENT, "
                "ExpId int NOT NULL, "
                "WorkerId int NOT NULL, "
                "AssignmentId int NOT NULL, "
@@ -16,7 +16,7 @@ cursor.execute("CREATE TABLE EXECUTIONS ("
                ")")
 
 cursor.execute("CREATE TABLE EXPERIMENTS ("
-               "ExpId int NOT NULL PRIMARY KEY, "
+               "ExpId int NOT NULL PRIMARY KEY AUTO_INCREMENT, "
                "ConfigPath varchar(255) NOT NULL, "
                "Assigned bit NOT NULL, "
                "Finished bit NOT NULL, "
@@ -26,7 +26,7 @@ cursor.execute("CREATE TABLE EXPERIMENTS ("
                ")")
 
 cursor.execute("CREATE TABLE ASSIGNMENTS ("
-               "AssignmentId int NOT NULL PRIMARY KEY, "
+               "AssignmentId int NOT NULL PRIMARY KEY AUTO_INCREMENT, "
                "ExpId int NOT NULL, "
                "WorkerId int NOT NULL, "
                "InProgress bit NOT NULL, "
@@ -46,10 +46,10 @@ cursor.execute("CREATE TABLE RESULTS ("
                "mAP float)")
 
 cursor.execute("CREATE TABLE REGISTERED_WORKERS ("
-               "WorkerId int NOT NULL PRIMARY KEY, "
+               "WorkerId int NOT NULL PRIMARY KEY AUTO_INCREMENT, "
                "WorkerName varchar(255) NOT NULL, "
                "GPUName varchar(255) NOT NULL, "
-               "GPUMemory varchar(255) NOT NULL"
+               "GPUMemory int NOT NULL"
                ")")
 
 cursor.execute("CREATE TABLE ONLINE_WORKERS ("

@@ -9,16 +9,19 @@ maxTaskTime_h = 72
 maxAssignmentWaitingTime_h = 24
 
 
-class Director:
+class Master:
     def __init__(self):
         self.conn, self.cursor = connection.connect()
-        self.maxLapseWithoutHeartbeat = datetime.timedelta(seconds=2*self.heartbeatPeriod_s)
         self.ReadSettings()
+        self.maxLapseWithoutHeartbeat = datetime.timedelta(seconds=2*self.heartbeatPeriod_s)
 
     # Read settings from database.
     def ReadSettings(self):
+        print('Reading settings from database...')
         self.cursor.execute('select Value from SETTINGS where Name=\'HeartbeatPeriod_s\'')
-        self.heartbeatPeriod_s = self.cursor.fetchone()[0][0]
+        self.heartbeatPeriod_s = float(self.cursor.fetchone()[0])
+        print('HeartbeatPeriod_s = ' + str(self.heartbeatPeriod_s))
+        print('All settings read.')
 
     def DoWork(self):
         while True:
@@ -43,6 +46,7 @@ class Director:
             end = time.time()
             lapse_s = end - start
             if lapse_s < self.heartbeatPeriod_s:
+                print('Waiting until next iteration...')
                 time.sleep(self.heartbeatPeriod_s - lapse_s)
 
     def SendHeartbeat(self):
@@ -171,7 +175,7 @@ class Director:
 
     def CheckAssignmentsWithOfflineWorkers(self):
         print('Checking assignments with offline workers...')
-        self.cursor.execute('select asg.* from ASSIGNMENTS where InProgress=1 and Finished=0 and Discarded=0')
+        self.cursor.execute('select * from ASSIGNMENTS where InProgress=1 and Finished=0 and Discarded=0')
         query_asg = self.cursor.fetchall()
         columns_asg = tools.get_columns_map(self.cursor)
         self.cursor.execute('select * from ONLINE_WORKERS')
@@ -193,6 +197,15 @@ class Director:
                 self.cursor.execute('update EXPERIMENTS set Assigned=0 where ExpId=' + str(asg[columns_asg['ExpId']]))
                 self.conn.commit()
                 print('De-assigned.')
+
+
+def StartMaster():
+    master = Master()
+    master.DoWork()
+
+
+if __name__ == '__main__':
+    StartMaster()
 
 
 

@@ -8,8 +8,6 @@ import tensorflow as tf
 import glob
 import subprocess
 
-workerInfoFileName = 'workerid.txt'
-
 class ExecutionInfo:
     def __init__(self, expId, success, errorCode, execTime_h):
         self.expId = expId
@@ -44,7 +42,7 @@ class Worker:
         self.ReadSettings()
 
     def ReadInfo(self):
-        infoPath = os.path.join(self.thisDir, workerInfoFileName)
+        infoPath = os.path.join(self.thisDir, glob.workerInfoFileName)
         if not os.path.exists(infoPath):
             print('Could not find worker info file in ' + str(infoPath))
             print('This probably mean that this worker has not been registered.\n'
@@ -54,7 +52,7 @@ class Worker:
             with open(infoPath, 'r') as fid:
                 lines = fid.read().split('\n')
             lines = [line for line in lines if line != '']
-            assert len(lines) == 1, 'There should be exactly one non-empty line in ' + workerInfoFileName + \
+            assert len(lines) == 1, 'There should be exactly one non-empty line in ' + glob.workerInfoFileName + \
                                     ', but there are ' + str(len(lines))
             # Parse id number:
             try:
@@ -71,10 +69,14 @@ class Worker:
 
     # Read settings from database.
     def ReadSettings(self):
+        print('Reading settings from database...')
         self.cursor.execute('select Value from SETTINGS where Name=\'HeartbeatPeriod_s\'')
-        self.heartbeatPeriod_s = self.cursor.fetchone()[0][0]
+        self.heartbeatPeriod_s = float(self.cursor.fetchone()[0])
+        print('HeartbeatPeriod_s = ' + str(self.heartbeatPeriod_s))
         self.cursor.execute('select Value from SETTINGS where Name=\'MaxExecTime_h\'')
-        self.maxExecTime_h = self.cursor.fetchone()[0][0]
+        self.maxExecTime_h = float(self.cursor.fetchone()[0])
+        print('MaxExecTime_h = ' + str(self.maxExecTime_h))
+        print('All settings read.')
 
     def DoWork(self):
         while True:
@@ -95,11 +97,13 @@ class Worker:
             except Exception as ex:
                 print('Error in main loop.')
                 print(ex)
+                raise
 
             # Wait for new loop.
             end = time.time()
             lapse_s = end - start
             if lapse_s < self.heartbeatPeriod_s:
+                print('Waiting until next iteration...')
                 time.sleep(self.heartbeatPeriod_s - lapse_s)
 
     def DoTask(self, exp, columns):
@@ -151,10 +155,17 @@ class Worker:
         execInfo = self.GetExecInfo()
         if execInfo.success:
             resultsSummary = self.GetResultsSummary()
-            self.cursor.execute('insert into RESULTS (BestEpoch, Loss, Accuracy, IoU, mAP) values (?, ?, ?, ?, ?)',
-                                (resultsSummary.bestEpoch, resultsSummary.loss, resultsSummary.accuracy,
+            self.cursor.execute('select max(ResultsId) from RESULTS')
+            query = self.cursor.fetchone()
+            if query[0] is None:
+                resultsId = 1
+            else:
+                maxResultsId = int(self.cursor.fetchone()[0])
+                resultsId = maxResultsId + 1
+            self.cursor.execute('insert into RESULTS (ResultsId, BestEpoch, Loss, Accuracy, IoU, mAP) values (?, ?, ?, ?, ?)',
+                                (resultsId, resultsSummary.bestEpoch, resultsSummary.loss, resultsSummary.accuracy,
                                  resultsSummary.iou, resultsSummary.mAP))
-            resultsId = self.cursor.execute("select SCOPE_IDENTITY()").fetchone()[0]
+            # resultsId = self.cursor.execute("select SCOPE_IDENTITY()").fetchone()[0]
         else:
             resultsId = None
         self.cursor.execute('insert into EXECUTIONS (ExpId, WorkerId, AssignmnetId, ResultsId, Success, ErrorCode, '
@@ -173,35 +184,39 @@ class Worker:
         query = self.cursor.fetchall()
         columns = tools.get_columns_map(self.cursor)
         # Look for the oldest assignment, in case there are several:
-        oldest_assignment_pos = None
-        oldest_assignment_date = None
-        for pos in range(len(query)):
-            row = query[pos]
-            assignmentDate = row[columns['AssignmentDate']]
-            if oldest_assignment_pos is None:
-                oldest_assignment_pos = pos
-                oldest_assignment_date = assignmentDate
-            else:
-                if assignmentDate < oldest_assignment_date:
+        if len(query) > 0:
+            oldest_assignment_pos = None
+            oldest_assignment_date = None
+            for pos in range(len(query)):
+                row = query[pos]
+                assignmentDate = row[columns['AssignmentDate']]
+                if oldest_assignment_pos is None:
                     oldest_assignment_pos = pos
                     oldest_assignment_date = assignmentDate
-        assignmentId = query[oldest_assignment_pos][columns['AssignmentId']]
-        expId = query[oldest_assignment_pos][columns['ExpId']]
-        # Start a thread to do the selected assignment, and continue with the normal loop meanwhile:
-        self.cursor.execute('select * from EXPERIMENTS where ExpId=' + str(expId))
-        query_exp = self.cursor.fetchall()
-        assert len(query_exp) == 1, 'There should be exactly one experiment with id ' + str(expId) + \
-                                    'but there are ' + str(len(query_exp))
-        exp = query_exp[0]
-        columns_exp = tools.get_columns_map(self.cursor)
-        self.cursor.execute('update ASSIGNMENTS set InProgress=1 and TakenDate=? where AssignmentId='
-                            + str(assignmentId), datetime.datetime.now())
-        self.conn.commit()
-        self.working = True
-        self.currAsgId = assignmentId
-        self.workerThread = Thread(target=self.DoTask, args=(exp, columns_exp))
-        print('Worker thread launched. Continue with normal loop.')
-        return
+                else:
+                    if assignmentDate < oldest_assignment_date:
+                        oldest_assignment_pos = pos
+                        oldest_assignment_date = assignmentDate
+            assignmentId = query[oldest_assignment_pos][columns['AssignmentId']]
+            expId = query[oldest_assignment_pos][columns['ExpId']]
+            # Start a thread to do the selected assignment, and continue with the normal loop meanwhile:
+            self.cursor.execute('select * from EXPERIMENTS where ExpId=' + str(expId))
+            query_exp = self.cursor.fetchall()
+            assert len(query_exp) == 1, 'There should be exactly one experiment with id ' + str(expId) + \
+                                        'but there are ' + str(len(query_exp))
+            exp = query_exp[0]
+            columns_exp = tools.get_columns_map(self.cursor)
+            self.cursor.execute('update ASSIGNMENTS set InProgress=1 and TakenDate=? where AssignmentId='
+                                + str(assignmentId), datetime.datetime.now())
+            self.conn.commit()
+            self.working = True
+            self.currAsgId = assignmentId
+            self.workerThread = Thread(target=self.DoTask, args=(exp, columns_exp))
+            print('Worker thread launched. Continue with normal loop.')
+            return
+        else:
+            print('There are no pending assignments for this worker.')
+            return
 
     def SendHeartbeat(self):
         print('Updating heartbeat...')
@@ -283,6 +298,15 @@ def ReadExecutionResults(expDir):
     iou = line_split[7]
     mAP = line_split[8]
     return bestEpoch, loss, accuracy, iou, mAP
+
+
+def StartWorker():
+    worker = Worker()
+    worker.DoWork()
+
+
+if __name__ == '__main__':
+    StartWorker()
 
 
 
